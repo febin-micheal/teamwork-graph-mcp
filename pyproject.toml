@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teamwork-graph-mcp"
+version = "1.0.0"
+description = "MCP server for Atlassian Teamwork Graph (Jira, Confluence, cross-links) via the twg CLI, for Claude and other AI agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+# Standard library only. Needs Atlassian's `twg` CLI on the PATH (not a Python package).
+dependencies = []
+keywords = ["mcp", "mcp-server", "model-context-protocol", "atlassian", "jira", "confluence", "teamwork-graph", "claude", "ai-agents"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+twg-mcp = "teamwork_graph_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

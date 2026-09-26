@@ -1,0 +1,27 @@
+# systemd user unit for teamwork-graph-mcp.
+#   cp examples/teamwork-graph-mcp.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now teamwork-graph-mcp
+# Replace <PATH-TO-TWG-MCP> with the output of `command -v twg-mcp`
+# (for a pipx install that is usually %h/.local/bin/twg-mcp).
+
+[Unit]
+Description=Atlassian Teamwork Graph MCP server (twg-mcp)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+EnvironmentFile=-%h/.config/twg-mcp/teamwork-graph-mcp.env
+ExecStart=<PATH-TO-TWG-MCP>
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# twg refreshes its OAuth token in ~/.config/twg and keeps caches in ~/.cache/twg
+ReadWritePaths=%h/.config/twg %h/.cache/twg
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
