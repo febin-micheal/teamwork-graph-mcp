@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "teamwork-graph-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for Atlassian Teamwork Graph (Jira, Confluence, cross-links) via the twg CLI, for Claude and other AI agents"
 readme = "README.md"
 license = "MIT"

@@ -6,12 +6,13 @@ One standard-library Python file. It serves streamable HTTP on the loopback inte
 
 ## Features
 
-Two tools. Each takes `{"args": [...]}`: the words that would follow `twg`, command first, global options (`-o json`, `--output-summary inline`, `--select …`) after them.
+Three tools. `twg_read` and `twg_write` each take `{"args": [...]}`: the words that would follow `twg`, command first, global options (`-o json`, `--output-summary inline`, `--select …`) after them. `twg_download` takes a Jira attachment id.
 
 | Tool | What it runs |
 |---|---|
 | `twg_read` | Only commands on the read allowlist (313 commands): get, query, list, search and other non-mutating subcommands |
 | `twg_write` | Only commands on the write allowlist (263 commands): create, update, delete, comment, transition, worklog, link/unlink, archive, approve, move, share, … |
+| `twg_download` | Downloads one Jira attachment by numeric id and returns it: images as images (large ones scaled down), videos as up to 10 evenly spaced frames, small text files as text, other types are only saved. Files go to one folder created with mode 700 (`TWG_MCP_DOWNLOAD_DIR`, default `~/.cache/twg-mcp/downloads`), are limited to 25 MB, and are deleted after 1 hour. Needs `ffmpeg` and `ffprobe` for scaling and video frames |
 
 Read allowlist, top-level commands: access, admin, artifacts, assets, capabilities, collaborators, commits, confluence, context, csm, deployments, docs, doctor, focus-areas, focus-areas-tree, goals, help, jira, jsm, loom, meetings, notifications, org-tree, people, pr-tree, projects, pull-requests, recently-viewed, resolve, responsibility, rovo, search-code, spaces, subgraph, talent, teams, trello, user, user-search, videos, whoami, work, work-tree, workitem-tree.
 
@@ -24,7 +25,7 @@ Refused by both tools:
 - `bitbucket` / `bb` (use a separate Bitbucket server, such as bitbucket-mcp)
 - `login`, `logout`, `auth …`, `admin auth …`, `rovo auth`, `env`, `setup …`, `update`/`upgrade`, `uninstall`, `upkeep …`, `consent`, `skills …`, `cache clear`, `completion`, `doctor --fix`
 - `benchmark …`, `feedback`, `visualize`
-- commands that move files between the server machine and Atlassian (attachment upload/download, `artifacts file create|update`, `loom video upload`)
+- commands that move files between the server machine and Atlassian (attachment upload/download, `artifacts file create|update`, `loom video upload`). The only exception is `twg_download`, which can write into its own download folder and nowhere else; uploads stay refused
 - every option that names a local file (`--body-file`, `--input-file`, `--variables-file`, `--out`, …). Pass content inline instead (`--body`, `--input-json`, `--variables-json`)
 - `api` with an absolute URL, so the credentials never go to another host
 

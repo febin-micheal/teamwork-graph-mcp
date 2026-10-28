@@ -21,6 +21,7 @@ those files, and never logs or returns a token.
 """
 
 import argparse
+import base64
 import hmac
 import http.server
 import json
@@ -36,7 +37,7 @@ import threading
 import time
 import urllib.parse
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 def _env_int(name, default):
     try:
@@ -91,6 +92,18 @@ if os.environ.get("TWG_CONFIG_DIR"):
 # Optional: shown to the model, e.g. "you@example.com", so it knows whose
 # account the tools act as.
 TWG_ACCOUNT_LABEL = os.environ.get("TWG_MCP_ACCOUNT_LABEL", "").strip()
+
+# twg_download: the only way a file reaches the server machine through this
+# server. It writes only inside DOWNLOAD_DIR and returns what it can.
+DOWNLOAD_DIR = os.path.expanduser(
+    os.environ.get("TWG_MCP_DOWNLOAD_DIR", "").strip()
+    or os.path.join("~", ".cache", "twg-mcp", "downloads")
+)
+DOWNLOAD_MAX_BYTES = _env_int("TWG_MCP_DOWNLOAD_MAX_BYTES", 25 * 1024 * 1024)
+DOWNLOAD_TTL = _env_int("TWG_MCP_DOWNLOAD_TTL", 3600)  # seconds before files are purged
+IMAGE_RAW_MAX = 4 * 1024 * 1024          # bigger images are scaled down first
+VIDEO_MAX_FRAMES = 10
+TEXT_RETURN_MAX = 100 * 1024
 
 # ==========================================================================
 # The allowlists. Generated once from `twg --help` walked recursively and the
@@ -858,7 +871,7 @@ WRITE_TOPS = top_level_words(WRITE_COMMANDS)
 MCP_INSTRUCTIONS = """\
 twg is Atlassian's Teamwork Graph CLI (Jira, Confluence, JSM, Assets, Goals,
 Projects, Teams, Loom, Trello, Rovo search, code search, people and org
-context), offered here as two tools%s.
+context), offered here as two tools (plus twg_download for attachments)%s.
 
 twg_read runs read-only commands. twg_write runs commands that change data.
 Both take one argument, args: the words that would follow `twg`, command first.
@@ -878,6 +891,10 @@ visualize, doctor --fix, admin auth, rovo auth, anything that uploads a file
 from or downloads a file to the server machine, and every option that names a local
 file (--body-file, --input-file, --variables-file, ...). Pass text inline
 instead (--body, --input-json, --variables-json).
+
+The third tool, twg_download, is the one exception for downloads: give it a
+numeric Jira attachment id and it returns the image, video frames or text. Files
+are kept for 1 hour in a locked folder on the server machine, then deleted.
 
 Read-only commands (twg_read)
 %s
@@ -931,6 +948,27 @@ MCP_TOOLS = [
             "readOnlyHint": False,
             "destructiveHint": True,
         },
+    },
+    {
+        "name": "twg_download",
+        "title": "twg (download a Jira attachment)",
+        "description": "Download one Jira attachment by its numeric id and return it: "
+        "images come back as images, videos as up to 10 frames, small text files as "
+        "text, anything else is only saved. The file stays in a locked folder on the "
+        "server machine for 1 hour and is then deleted. Get attachment ids from "
+        "`jira workitem get`. Limit 25 MB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {
+                    "type": "string",
+                    "description": 'Numeric Jira attachment id, for example "95290".',
+                }
+            },
+            "required": ["attachment_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "twg (download a Jira attachment)", "readOnlyHint": False},
     },
 ]
 
@@ -1080,6 +1118,152 @@ def rpc_error(code, message):
     return {"code": code, "message": message}
 
 
+# ---- twg_download --------------------------------------------------------
+def _purge_downloads():
+    now = time.time()
+    try:
+        names = os.listdir(DOWNLOAD_DIR)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(DOWNLOAD_DIR, name)
+        try:
+            if now - os.lstat(path).st_mtime > DOWNLOAD_TTL:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+        except OSError:
+            pass
+
+
+def _json_from(output):
+    text = output.decode("utf-8", "replace")
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        obj = json.loads(text[i:j + 1])
+    except ValueError:
+        return None
+    data = obj.get("data", obj) if isinstance(obj, dict) else None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
+def _image_block(path, mime):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    return {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime}
+
+
+def _run_tool(cmd, timeout):
+    try:
+        proc = subprocess.run(cmd, shell=False, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout, cwd=TWG_HOME, env=dict(TWG_ENV))
+        return proc.returncode, proc.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None, b""
+
+
+def download_attachment(arguments, state, log):
+    """twg_download: fetch one Jira attachment into DOWNLOAD_DIR and return it.
+
+    Images come back as images; videos come back as up to 10 frames; text
+    files come back as text; anything else is saved and reported by size.
+    """
+    log["tool"] = "twg_download"
+    log["args"] = "jira workitem attachment download"
+    log["kind"] = "download"
+    att_id = arguments.get("attachment_id")
+    if isinstance(att_id, int):
+        att_id = str(att_id)
+    if not isinstance(att_id, str) or not re.fullmatch(r"[0-9]{1,12}", att_id):
+        return tool_result("attachment_id must be the numeric Jira attachment id, "
+                           "for example \"95290\". Get ids from jira workitem get.", True)
+    if not _MCP_SLOTS.acquire(blocking=False):
+        return tool_result("busy, retry shortly", True)
+    try:
+        os.makedirs(DOWNLOAD_DIR, mode=0o700, exist_ok=True)
+        os.chmod(DOWNLOAD_DIR, 0o700)
+        _purge_downloads()
+
+        code, out = run_twg(["jira", "workitem", "attachment", "get",
+                             "--attachment-id", att_id, "-o", "json",
+                             "--output-summary", "none"])
+        meta = _json_from(out) if code == 0 else None
+        if not meta or not meta.get("filename"):
+            log["exit"] = code
+            return tool_result("Could not read attachment %s: %s" % (
+                att_id, redact(out.decode("utf-8", "replace"), state.get("secret"))[:500]), True)
+        size = int(meta.get("size") or 0)
+        mime = str(meta.get("mimeType") or "application/octet-stream")
+        if size > DOWNLOAD_MAX_BYTES:
+            return tool_result("Attachment %s is %d bytes; the limit is %d."
+                               % (att_id, size, DOWNLOAD_MAX_BYTES), True)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(meta["filename"]))[:120] or "file"
+        path = os.path.join(DOWNLOAD_DIR, "%s_%s" % (att_id, safe))
+        real_dir = os.path.realpath(DOWNLOAD_DIR)
+        if os.path.dirname(os.path.realpath(path)) != real_dir:
+            return tool_result("Refused: output path is outside the download folder.", True)
+
+        code, out = run_twg(["jira", "workitem", "attachment", "download",
+                             "--attachment-id", att_id, "--output-path", path])
+        log["exit"] = code
+        if code != 0 or not os.path.isfile(path):
+            return tool_result("Download failed: %s" % redact(
+                out.decode("utf-8", "replace"), state.get("secret"))[:500], True)
+        real_size = os.path.getsize(path)
+        head = "Attachment %s: %s, %s, %d bytes (kept on the server machine for 1 hour)." % (
+            att_id, meta["filename"], mime, real_size)
+        content = [{"type": "text", "text": head}]
+
+        if mime in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+            use, use_mime = path, mime
+            if real_size > IMAGE_RAW_MAX:
+                scaled = path + ".scaled.jpg"
+                rc, _ = _run_tool(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf",
+                                   "scale='min(2000,iw)':-2", "-q:v", "3", scaled], 60)
+                if rc == 0 and os.path.isfile(scaled):
+                    use, use_mime = scaled, "image/jpeg"
+                    content[0]["text"] += " Scaled down to fit."
+            content.append(_image_block(use, use_mime))
+        elif mime.startswith("video/"):
+            step = 2.0
+            rc, dur = _run_tool(["ffprobe", "-v", "error", "-show_entries",
+                                 "format=duration", "-of", "csv=p=0", path], 30)
+            try:
+                seconds = float(dur.decode().strip().splitlines()[0])
+                step = max(2.0, seconds / VIDEO_MAX_FRAMES)
+                content[0]["text"] += " Duration %.1f s." % seconds
+            except (ValueError, IndexError):
+                pass
+            frames_dir = path + ".frames"
+            os.makedirs(frames_dir, mode=0o700, exist_ok=True)
+            rc, _ = _run_tool(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf",
+                               "fps=1/%s,scale=1280:-2" % step, "-frames:v",
+                               str(VIDEO_MAX_FRAMES), "-q:v", "4",
+                               os.path.join(frames_dir, "frame_%02d.jpg")], 90)
+            names = sorted(n for n in os.listdir(frames_dir) if n.endswith(".jpg"))
+            content[0]["text"] += " %d frame(s), one every %.1f s." % (len(names), step)
+            for index, name in enumerate(names):
+                content.append({"type": "text", "text": "frame %d at about %.0f s" % (
+                    index + 1, index * step)})
+                content.append(_image_block(os.path.join(frames_dir, name), "image/jpeg"))
+        elif mime.startswith("text/") and real_size <= TEXT_RETURN_MAX:
+            with open(path, "rb") as fh:
+                content.append({"type": "text", "text": fh.read().decode("utf-8", "replace")})
+        else:
+            content[0]["text"] += " This type cannot be returned here; it is only saved."
+        return {"content": content, "isError": False}
+    except (OSError, ValueError) as exc:
+        return tool_result("twg_download failed: %s" % exc, True)
+    finally:
+        _MCP_SLOTS.release()
+
+
 def tools_call(params, state, log):
     """tools/call. Only an unknown tool or malformed params is a protocol error."""
     if not isinstance(params, dict):
@@ -1092,6 +1276,8 @@ def tools_call(params, state, log):
         arguments = {}
     if not isinstance(arguments, dict):
         return rpc_error(-32602, "arguments must be an object"), None
+    if name == "twg_download":
+        return None, download_attachment(arguments, state, log)
     if name not in ("twg_read", "twg_write"):
         return rpc_error(-32602, "unknown tool: %s" % name), None
 
